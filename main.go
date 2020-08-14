@@ -8,27 +8,57 @@ import (
 	"strconv"
 	"strings"
 
-	// TODO(adammck): Remove this dep, only using a single attribute.
+	// TODO(adammck): Remove this dep, only using two attributes.
 	"github.com/shirou/gopsutil/mem"
 )
 
-func hostMemoryLimit() (uint64, error) {
+type memInfo struct {
+	Total uint64
+	Used  uint64
+}
+
+func hostMemory() (memInfo, error) {
 	vm, err := mem.VirtualMemory()
 	if err != nil {
-		return 0, err
+		return memInfo{}, err
 	}
 
-	return vm.Total, nil
+	return memInfo{
+		Total: vm.Total,
+		Used:  vm.Used,
+	}, nil
 }
 
 var errNotInContainer = errors.New("not running in a container")
 var errNoMemoryLimit = errors.New("no cgroup memory limit is set")
 
-func containerMemoryLimit() (uint64, error) {
-	fn := "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+func containerMemory() (memInfo, error) {
+	tot, err := readCgroupMemoryFile("limit_in_bytes")
+	if err != nil {
+		return memInfo{}, err
+	}
 
-	// return early if the file doesn't exist. we're probably just not running
-	// in a cgroup.
+	// return an error instead of the special *no limit* value. callers will
+	// probably want to fall back to the host memory limit rather than assume
+	// they have 8EiB of memory available.
+	if tot == 9223372036854771712 {
+		return memInfo{}, errNoMemoryLimit
+	}
+
+	use, err := readCgroupMemoryFile("usage_in_bytes")
+	if err != nil {
+		return memInfo{}, err
+	}
+
+	return memInfo{
+		Total: tot,
+		Used:  use,
+	}, nil
+}
+
+func readCgroupMemoryFile(suffix string) (uint64, error) {
+	fn := fmt.Sprintf("/sys/fs/cgroup/memory/memory.%s", suffix)
+
 	_, err := os.Stat(fn)
 	if os.IsNotExist(err) {
 		return 0, errNotInContainer
@@ -41,43 +71,37 @@ func containerMemoryLimit() (uint64, error) {
 
 	val, err := strconv.ParseUint(strings.TrimSuffix(string(buf), "\n"), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("while casting cgroup memory limit to uint64: %s", err)
-	}
-
-	// return an error instead of the special *no limit* value. callers will
-	// probably want to fall back to the host memory limit rather than assume
-	// they have 8EiB of memory available.
-	if val == 9223372036854771712 {
-		return val, errNoMemoryLimit
+		return 0, fmt.Errorf("while casting cgroup memory to uint64: %s", err)
 	}
 
 	return val, nil
 }
 
 func main() {
-	lim, err := containerMemoryLimit()
-	if err == nil {
-		fmt.Printf("available container memory: %d bytes\n", lim)
-		os.Exit(0)
-	}
+	useHost := false
+	mem, err := containerMemory()
 
 	if err == errNotInContainer {
 		fmt.Println("[info] not running in a container")
+		useHost = true
 
 	} else if err == errNoMemoryLimit {
-		fmt.Println("[warn] in container but no memory limit set")
+		fmt.Println("[warn] in container but no memory limit set; falling back to host metrics")
+		useHost = true
 
-	} else {
-		fmt.Printf("error fetching container memory: %s\n", err)
+	} else if err != nil {
+		fmt.Printf("error fetching container memory stats: %s\n", err)
 		os.Exit(1)
 	}
 
-	lim, err = hostMemoryLimit()
-	if err != nil {
-		fmt.Printf("error fetching host memory: %s\n", err)
-		os.Exit(1)
+	if useHost {
+		mem, err = hostMemory()
+		if err != nil {
+			fmt.Printf("error fetching host memory stats: %s\n", err)
+			os.Exit(1)
+		}
 	}
 
-	fmt.Printf("available host memory: %d bytes\n", lim)
-	os.Exit(0)
+	fmt.Printf("total: %d bytes\n", mem.Total)
+	fmt.Printf("used: %d bytes\n", mem.Used)
 }
